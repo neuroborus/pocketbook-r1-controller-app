@@ -1,0 +1,15 @@
+# Local experiments, logs, binaries, captures and agent handoff notes.
+/LOCAL_ARTIFACTS/
+
+# Build output
+/build/
+*.o
+*.a
+*.so
+*.so.*
+*.out
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
