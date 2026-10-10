@@ -158,7 +158,11 @@ int main(void)
     char *version_argv[] = {"r1-controller", "--version", NULL};
     assert(controller_program_main(2, version_argv) == 0);
     interrupted_wait_test();
-    char directory[] = "/tmp/r1-launch-test-XXXXXX";
+    char directory[sizeof(test_lock) - 6];
+    const char *temporary = getenv("TMPDIR");
+    if (!temporary || !*temporary) temporary = "/tmp";
+    int length = snprintf(directory, sizeof(directory), "%s/r1-launch-test-XXXXXX", temporary);
+    assert(length > 0 && (size_t)length < sizeof(directory));
     assert(mkdtemp(directory));
     assert(snprintf(test_lock, sizeof(test_lock), "%s/lock", directory) > 0);
     assert(controller_control(0) == 0);

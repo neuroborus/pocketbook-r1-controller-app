@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
+#include <mqueue.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -93,10 +94,12 @@ static icanvas canvas_snapshot;
 static uint8_t *background;
 static size_t canvas_size;
 static int touch_fd = -1;
+static mqd_t hardware_queue = (mqd_t)-1;
 static int top_key_fd = -1;
 static int gpio_fd = -1;
 static struct return_button return_button;
-static int c_down;
+static int c_down, circle_down;
+static int discard_r1, suppress_return;
 static struct input_absinfo touch_x, touch_y;
 static struct r1_event_queue pending;
 static uint64_t session_deadline;
@@ -142,6 +145,10 @@ static void cleanup(void)
         }
     }
     presented = 0;
+    if (hardware_queue != (mqd_t)-1) {
+        mq_close(hardware_queue);
+        hardware_queue = (mqd_t)-1;
+    }
     if (touch_fd >= 0) { close(touch_fd); touch_fd = -1; }
     if (top_key_fd >= 0) { close(top_key_fd); top_key_fd = -1; }
     if (gpio_fd >= 0) { close(gpio_fd); gpio_fd = -1; }
@@ -243,7 +250,7 @@ static void reconnect_r1(void)
         if (result < 0 && errno == EINTR) return;
         if (result >= 0 && !(p.revents & (POLLHUP | POLLERR | POLLNVAL))) return;
         (void)ioctl(r1,EVIOCGRAB,0); close(r1); r1=-1;
-        memset(&return_button,0,sizeof(return_button)); c_down=0;
+        memset(&return_button,0,sizeof(return_button)); c_down=circle_down=suppress_return=0;
         memset(&repeat_click,0,sizeof(repeat_click));
         memset(&pending,0,sizeof(pending)); controller_map_reset(&mapping);
         puts("R1_DISCONNECTED waiting for reconnect");
@@ -265,6 +272,67 @@ static int init_touch(void)
     printf("TOUCH_RANGE x=%d..%d y=%d..%d\n", touch_x.minimum, touch_x.maximum,
         touch_y.minimum, touch_y.maximum);
     return 0;
+}
+
+/* Firmware 6.10 uses one /hwevent queue. hw_nextevent() consumes it only in
+ * the active task (native libinkview, also inkinternal.h:439-446,979-981).
+ * Observe its length WITHOUT receiving, injecting, flushing or unlinking:
+ * returning focus is intended to let the stock app receive the original
+ * gesture, including multitouch data. Physical validation is still pending. */
+static int init_hardware_queue(void)
+{
+    hardware_queue = mq_open("/hwevent", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (hardware_queue == (mqd_t)-1) { perror("hardware queue open"); return -1; }
+    struct mq_attr attr;
+    if (mq_getattr(hardware_queue, &attr) < 0 || attr.mq_msgsize != 40) {
+        fputs("Unsupported hardware event queue\n", stderr);
+        mq_close(hardware_queue);
+        hardware_queue = (mqd_t)-1;
+        return -1;
+    }
+    puts("NATIVE_INPUT enabled; observing firmware queue without consuming events");
+    return 0;
+}
+
+static void discard_controller_actions(void)
+{
+    discard_r1 = 1;
+    suppress_return |= return_button.down;
+    memset(&pending, 0, sizeof(pending));
+    memset(&repeat_click, 0, sizeof(repeat_click));
+    /* Native handoff does not change the controller mode or its switch guard. */
+    memset(mapping.down, 0, sizeof(mapping.down));
+    mapping.axes[0] = mapping.axes[1] = 1;
+    c_down = circle_down = 0;
+}
+
+static int controller_return_event(const struct input_event *ev)
+{
+    suppress_return |= discard_r1;
+    int action = return_button_event(&return_button, ev->value, input_time_ms(ev));
+    if (suppress_return && action == 1) action = 0;
+    if (!return_button.down) suppress_return = 0;
+    return action;
+}
+
+static int native_input_busy(void)
+{
+    /* Latch observed activity until the controller backlog is drained, even
+     * if the stock app empties /hwevent before the next observation. */
+    if (hardware_queue == (mqd_t)-1) return 0;
+    struct mq_attr attr;
+    if (mq_getattr(hardware_queue, &attr) < 0) { perror("hardware queue state"); return -1; }
+    if (attr.mq_curmsgs) { discard_controller_actions(); return 1; }
+    /* An empty queue does not mean a held finger has finished its gesture. */
+    unsigned long keys[(KEY_MAX + 8 * sizeof(unsigned long)) / (8 * sizeof(unsigned long))] = {0};
+    unsigned bits = 8U * sizeof(unsigned long);
+    if (touch_fd < 0) { fputs("Physical touch device unavailable\n", stderr); return -1; }
+    if (ioctl(touch_fd, EVIOCGKEY(sizeof(keys)), keys) < 0) {
+        perror("physical touch state"); return -1;
+    }
+    int busy = (keys[BTN_TOUCH / bits] & (1UL << (BTN_TOUCH % bits))) != 0;
+    if (busy) discard_controller_actions();
+    return busy;
 }
 
 static int emit_input(int fd, int type, int code, int value)
@@ -576,16 +644,42 @@ static void reader_diagnostics(void)
 static void drain_while_clicking(void)
 {
     if (application_mode) reconnect_r1();
+    int native_busy = native_input_busy();
+    if (native_busy < 0) { running = 0; return; }
     struct input_event ev;
-    int batch = 0;
-    while (r1 >= 0 && batch++ < 256 && read(r1, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+    for (int batch = 0; batch < 256; ++batch) {
+        /* A quick tap can finish before this first drain. Keep discarding
+         * across bounded batches until an idle read proves the backlog empty. */
+        ssize_t size = r1 >= 0 ? read(r1, &ev, sizeof(ev)) : 0;
+        if (size != (ssize_t)sizeof(ev)) {
+            if (!native_busy && (r1 < 0 || (size < 0 && errno == EAGAIN))) discard_r1 = 0;
+            if (r1 >= 0 && !(size < 0 && (errno == EAGAIN || errno == EINTR))) {
+                puts("INPUT_READ_FAILED during click"); running = 0;
+            }
+            return;
+        }
+        native_busy = native_input_busy();
+        if (native_busy < 0) { running = 0; return; }
+        if (ev.type == EV_SYN && ev.code == SYN_DROPPED) {
+            puts("SYN_DROPPED during click; exit"); running = 0; return;
+        }
+        /* Finger input wins. Discard overlapping controller actions instead
+         * of replaying a delayed click/movement after the gesture. Long Return
+         * remains available to stop, but short Back must not interrupt touch. */
+        if (discard_r1) {
+            if (ev.type == EV_KEY && (ev.code == BTN_RIGHT || ev.code == 311) &&
+                controller_return_event(&ev) == 2) {
+                puts("RETURN_LONG exit"); running = 0; return;
+            }
+            continue;
+        }
         int mapped=controller_map_event(&mapping,&ev,now_ms());
         if (mapped) {
             if (foreground_key(mapped)<0) { puts("MAPPED_KEY_FAILED"); running=0; return; }
             continue;
         }
         if (ev.type == EV_KEY && (ev.code == BTN_RIGHT || ev.code == 311)) {
-            int action = return_button_event(&return_button, ev.value, input_time_ms(&ev));
+            int action = controller_return_event(&ev);
             if (action == 2) { puts("RETURN_LONG exit"); running = 0; return; }
             if (action == 1) {
                 if (foreground_key(KEY_BACK) < 0) {
@@ -618,11 +712,6 @@ static void drain_while_clicking(void)
                 } else puts("SECOND_CLICK_SKIPPED target changed or pair already sent");
             }
             continue;
-        }
-        if (ev.type == EV_SYN && ev.code == SYN_DROPPED) {
-            puts("SYN_DROPPED during click; exit");
-            running = 0;
-            return;
         }
         /* Controls above have already been delivered. Retain only pointer
          * motion and its frame boundaries for replay after taking focus back;
@@ -662,6 +751,12 @@ static int await_foreground(int x,int y,uint32_t before_hash)
         usleep(150000);
         drain_while_clicking();
         if (!running || usb_configured() == USB_CONNECTED) return -1;
+        int native_busy = native_input_busy();
+        if (native_busy < 0) return -1;
+        if (native_busy || discard_r1) {
+            copied = 0;
+            continue;
+        }
         iv.active(&active, &sub);
         taskinfo *info = active > 0 && active != self ? iv.info(active) : NULL;
         if (!info || info->mainpid <= 0 || kill(info->mainpid, 0) != 0) {
@@ -684,6 +779,9 @@ static int await_foreground(int x,int y,uint32_t before_hash)
         iv.copy();
         if (refresh_canvas() < 0) return -1;
         uint32_t hash = frame_hash();
+        native_busy = native_input_busy();
+        if (native_busy < 0) return -1;
+        if (native_busy) { copied = 0; continue; }
         if (hash != last_hash || active != last_task || now_ms() >= next_notice) {
             printf("APP_FRAME task=%d app=%s hash=%08x elapsed_ms=%llu\n", active,
                 info->appname ? info->appname : "(null)", hash,
@@ -705,28 +803,61 @@ static int await_foreground(int x,int y,uint32_t before_hash)
             }
             continue;
         }
-        if (click_frame_ready(now_ms() - capture_started, now_ms() - stable_since,
-                             changed, pending.motion)) break;
-        if (pending.motion && now_ms() - capture_started >= 6000) break;
+        if (!click_frame_ready(now_ms() - capture_started, now_ms() - stable_since,
+                              changed, pending.motion) &&
+            !(pending.motion && now_ms() - capture_started >= 6000)) continue;
+        previous = last_task; previous_sub = last_sub;
+        memcpy(background, canvas->addr, canvas_size);
+        printf("CLICK_RESULT changed=%d task=%d sub=%d elapsed_ms=%llu hash=%08x\n",
+            changed, previous, previous_sub, (unsigned long long)(now_ms() - start), last_hash);
+        printf("CLICK_QUEUED events=%zu motion=%d\n", pending.count, pending.motion);
+        /* Capture, hashing and copying take time. Revalidate immediately
+         * before reclaim, and return focus if input races the activation. */
+        iv.active(&active, &sub);
+        if (active != last_task || sub != last_sub) { copied = 0; continue; }
+        native_busy = native_input_busy();
+        if (native_busy < 0) return -1;
+        if (native_busy) { copied = 0; continue; }
+        if (!running || now_ms() >= session_deadline || activate_checked(self, 0) < 0) return -1;
+        if (wait_display() < 0 || refresh_canvas() < 0) return -1;
+        native_busy = native_input_busy();
+        if (native_busy < 0) return -1;
+        if (native_busy) {
+            if (activate_checked(previous, previous_sub) < 0) return -1;
+            copied = 0;
+            continue;
+        }
+        memcpy(canvas->addr, background, canvas_size);
+        /* An unchanged click needs no redundant full-screen grayscale repaint. */
+        if (changed) update_rect((cursor_rect){0, 0, canvas->width, canvas->height}, 0);
+        return render_cursor(x, y, x, y, 0);
     }
-    if (now_ms() >= session_deadline) { puts("SESSION_TIMEOUT during click"); return -1; }
-    if (!running || !copied) return -1;
-    previous = last_task; previous_sub = last_sub;
-    memcpy(background, canvas->addr, canvas_size);
-    printf("CLICK_RESULT changed=%d task=%d sub=%d elapsed_ms=%llu hash=%08x\n",
-        changed, previous, previous_sub, (unsigned long long)(now_ms() - start), last_hash);
-    printf("CLICK_QUEUED events=%zu motion=%d\n", pending.count, pending.motion);
-    if (activate_checked(self, 0) < 0) return -1;
-    if (wait_display() < 0) return -1;
-    if (refresh_canvas() < 0) return -1;
-    memcpy(canvas->addr, background, canvas_size);
-    /* An unchanged click needs no redundant full-screen grayscale repaint. */
-    if (changed) update_rect((cursor_rect){0, 0, canvas->width, canvas->height}, 0);
-    return render_cursor(x, y, x, y, 0);
+    if (now_ms() >= session_deadline) puts("SESSION_TIMEOUT during click");
+    return -1;
+}
+
+static int yield_to_native_input(int x, int y)
+{
+    taskinfo *info = previous > 0 && previous != self ? iv.info(previous) : NULL;
+    if (!info || info->mainpid <= 0 || kill(info->mainpid, 0) != 0) return -1;
+    if (wait_display() < 0 || refresh_canvas() < 0) return -1;
+    cursor_rect area = cursor_dirty(x, y, x, y, canvas->width, canvas->height);
+    cursor_restore(canvas->addr, background, canvas->scanline, area);
+    uint32_t before_hash = frame_hash();
+    /* Do not delay a live gesture with the optional trail-repair batch. The
+     * foreground task restores its own screen. Never consume/replay its input. */
+    cursor_repair_reset(&repair);
+    discard_controller_actions();
+    if (activate_checked(previous, previous_sub) < 0) return -1;
+    puts("NATIVE_INPUT_HANDOFF cursor hidden; original hardware events left queued");
+    return await_foreground(x, y, before_hash);
 }
 
 static int click_through(int x, int y, int key_code)
 {
+    int native_busy = native_input_busy();
+    if (native_busy < 0) return -1;
+    if (native_busy || discard_r1) return yield_to_native_input(x, y);
     int park=key_code==-1;
     if (park) key_code=0;
     int key_fd = key_code == KEY_POWER ? top_key_fd : gpio_fd;
@@ -754,12 +885,18 @@ static int click_through(int x, int y, int key_code)
      * old trails must not survive an unchanged menu/click. */
     cursor_repair_hide(&repair,x,y,area);
     if (flush_cursor_repair()<0 || wait_display()<0) return -1;
+    native_busy = native_input_busy();
+    if (native_busy < 0) return -1;
+    if (native_busy) return yield_to_native_input(x, y);
     if (activate_checked(previous, previous_sub) < 0) return -1;
     usleep(120000);
     int active = -1, sub = 0;
     iv.active(&active, &sub);
     if (!running || active != previous || sub != previous_sub) return -1;
     memset(&repeat_click, 0, sizeof(repeat_click));
+    native_busy = native_input_busy();
+    if (native_busy < 0) return -1;
+    if (native_busy) return await_foreground(x, y, before_hash);
     if (park) {
         puts("CURSOR_PARKED move R1 to resume");
     } else if (key_code) {
@@ -846,6 +983,7 @@ int main(int argc, char **argv)
 
     if (load_iv() < 0) return 1;
     if ((wait_usb || probe) && init_touch() < 0) return 1;
+    if (application_mode && init_hardware_queue() < 0) return 1;
     if (wait_usb || probe) {
         top_key_fd = open_input("pmu1736-powerkey", O_RDWR | O_NONBLOCK, 0);
         gpio_fd = open_input("gpio_keys", O_RDWR | O_NONBLOCK, 0);
@@ -951,41 +1089,57 @@ int main(int argc, char **argv)
     if (!background) return 1;
     memcpy(background, canvas->addr, canvas_size);
     if (!running) return 1;
-    int result = iv.activate(self, 0);
-    presented = 1;
-    printf("ACTIVATE result=%d\n", result);
-    int active = -1, sub = 0;
-    uint64_t deadline = now_ms() + 3000;
-    do {
-        usleep(100000);
-        iv.active(&active, &sub);
-    } while (running && active != self && now_ms() < deadline);
-    if (!running || active != self) {
-        printf("EXIT activation not confirmed active=%d\n", active);
-        cleanup();
-        return 1;
-    }
-    if (wait_display() < 0) { cleanup(); return 1; }
-    if (refresh_canvas() < 0) { cleanup(); return 1; }
-    printf("ACTIVATED addr=%p hash=%08x invert=%d caps=%d\n", (void *)canvas->addr,
-           frame_hash(), iv.inverted(), iv.get_caps());
-    memcpy(canvas->addr, background, canvas_size);
-    /* Present unchanged snapshot once with correct inversion and no line processing. */
-    update_rect((cursor_rect){0, 0, canvas->width, canvas->height}, 0);
     int x = canvas->width / 2, y = canvas->height / 2;
     int drawn_x = x, drawn_y = y;
     cursor_init_mask();
-    if (render_cursor(x, y, x, y, 0) < 0) { cleanup(); return 1; }
+    session_deadline = application_mode ? UINT64_MAX : now_ms() + (smoke ? 3000 : 300000);
+    int active = -1, sub = 0;
+    int native_busy = native_input_busy();
+    if (native_busy < 0) return 1;
+    presented = 1;
+    if (native_busy) {
+        puts("START_IN_FOREGROUND native interaction in progress; move R1 afterward");
+        if (await_foreground(x, y, 0) < 0) { cleanup(); return 1; }
+    } else {
+        int result = iv.activate(self, 0);
+        printf("ACTIVATE result=%d\n", result);
+        uint64_t activation_deadline = now_ms() + 3000;
+        do {
+            usleep(100000);
+            iv.active(&active, &sub);
+        } while (running && active != self && now_ms() < activation_deadline);
+        if (!running || active != self) {
+            printf("EXIT activation not confirmed active=%d\n", active);
+            cleanup();
+            return 1;
+        }
+        if (wait_display() < 0) { cleanup(); return 1; }
+        if (refresh_canvas() < 0) { cleanup(); return 1; }
+        native_busy = native_input_busy();
+        if (native_busy < 0) { cleanup(); return 1; }
+        if (native_busy) {
+            if (activate_checked(previous, previous_sub) < 0 || await_foreground(x, y, 0) < 0) {
+                cleanup(); return 1;
+            }
+        } else {
+            printf("ACTIVATED addr=%p hash=%08x invert=%d caps=%d\n", (void *)canvas->addr,
+                   frame_hash(), iv.inverted(), iv.get_caps());
+            memcpy(canvas->addr, background, canvas_size);
+            /* Present unchanged snapshot once with correct inversion and no line processing. */
+            update_rect((cursor_rect){0, 0, canvas->width, canvas->height}, 0);
+            if (render_cursor(x, y, x, y, 0) < 0) { cleanup(); return 1; }
+        }
+    }
     printf("MARKER_READY adaptive arrow; M+D moves; circle clicks; C top key; Return Back; hold Return 1s+release exits; timeout %d seconds\n",
            application_mode?0:smoke ? 3 : 300);
-    deadline = application_mode?UINT64_MAX:now_ms() + (smoke ? 3000 : 300000);
+    uint64_t deadline = application_mode?UINT64_MAX:now_ms() + (smoke ? 3000 : 300000);
     if (application_mode) puts("APPLICATION_READY no session timeout; hold Return 1s and release to stop");
     session_deadline = deadline;
     struct pointer_motion motion = {0};
     int dx = 0, dy = 0;
     uint64_t next_reconnect = 0;
     uint64_t next_frame = now_ms() + FRAME_INTERVAL_MS;
-    int circle_down = 0;
+    circle_down = 0;
     while (running && now_ms() < deadline) {
         if (application_mode) controller_rotate_log();
         if (!smoke && usb_configured() == 1) { puts("USB_RECONNECTED exit"); break; }
@@ -997,6 +1151,16 @@ int main(int argc, char **argv)
             x=drawn_x; y=drawn_y; dx=dy=0; memset(&motion,0,sizeof(motion));
             if (await_foreground(x,y,0)<0) break;
             next_frame=now_ms()+FRAME_INTERVAL_MS; continue;
+        }
+        int native_busy = native_input_busy();
+        if (native_busy < 0) break;
+        if (native_busy || discard_r1) {
+            x = drawn_x; y = drawn_y; dx = dy = 0;
+            circle_down = 0;
+            memset(&motion, 0, sizeof(motion));
+            if (yield_to_native_input(x, y) < 0) break;
+            next_frame = now_ms() + FRAME_INTERVAL_MS;
+            continue;
         }
         if ((x != drawn_x || y != drawn_y) && now_ms() >= next_frame) {
             if (render_cursor(drawn_x, drawn_y, x, y, 1) < 0) break;
@@ -1014,6 +1178,11 @@ int main(int argc, char **argv)
         struct pollfd pfd = {.fd = r1, .events = POLLIN};
         int ready = pending.count ? 1 : poll(&pfd, 1, 20);
         if (ready < 0 && errno == EINTR) continue;
+        /* A touch may have arrived during rendering or poll. Yield before
+         * processing a competing controller action or starting idle repair. */
+        native_busy = native_input_busy();
+        if (native_busy < 0) break;
+        if (native_busy) continue;
         if (ready < 0 || (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) {
             ioctl(r1, EVIOCGRAB, 0);
             close(r1);
@@ -1022,6 +1191,7 @@ int main(int argc, char **argv)
             circle_down = 0;
             c_down = 0;
             memset(&return_button, 0, sizeof(return_button));
+            suppress_return = 0;
             memset(&pending, 0, sizeof(pending));
             memset(&motion, 0, sizeof(motion));
             controller_map_reset(&mapping);
@@ -1036,7 +1206,10 @@ int main(int argc, char **argv)
         }
         struct input_event ev;
         int batch = 0;
-        while (running && batch++ < 256 && next_input(&ev)) {
+        while (running && batch++ < 256) {
+            native_busy = native_input_busy();
+            if (native_busy < 0) { running = 0; break; }
+            if (native_busy || discard_r1 || !next_input(&ev)) break;
             int mapped=controller_map_event(&mapping,&ev,now_ms());
             if (mapped) {
                 x=drawn_x; y=drawn_y; dx=dy=0; memset(&motion,0,sizeof(motion));
@@ -1044,7 +1217,7 @@ int main(int argc, char **argv)
                 next_frame=now_ms()+FRAME_INTERVAL_MS; continue;
             }
             if (ev.type == EV_KEY && (ev.code == BTN_RIGHT || ev.code == 311)) {
-                int action = return_button_event(&return_button, ev.value, input_time_ms(&ev));
+                int action = controller_return_event(&ev);
                 if (action == 2) { puts("RETURN_LONG exit"); running = 0; break; }
                 if (action == 1) {
                     x = drawn_x; y = drawn_y; dx = dy = 0;
